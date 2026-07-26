@@ -5,7 +5,12 @@ from pydantic import BaseModel
 from typing import List
 from sentence_transformers import SentenceTransformer
 from collections import defaultdict
-from ingestion_pipeline import EmbeddingFunction
+from ingestion_pipeline import EmbeddingFunction, load_documents, split_documents
+from langchain_cohere import CohereRerank
+from langchain_core.documents import Document
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_classic.retrievers import EnsembleRetriever
+from langchain_community.retrievers import BM25Retriever
 
 load_dotenv()
 
@@ -20,16 +25,23 @@ db = Chroma(
     collection_metadata={"hnsw:space": "cosine"}
 )
 
+# Load and chunk documents via the ingestion pipeline
+raw_documents = load_documents("docs")
+chunks = split_documents(raw_documents, chunk_size=1000, chunk_overlap=0)
+
 # Pydantic model for structured output
 class QueryVariations(BaseModel):
     queries: List[str]
+
 # ──────────────────────────────────────────────────────────────────
 # MAIN EXECUTION
 # ──────────────────────────────────────────────────────────────────
 
 # Original query
-original_query = "Tell me about the commercial success of Bigbang?"
+original_query = "Tell me about the discography of Twice?"
+print("\n" + "="*60)
 print(f"Original Query: {original_query}\n")
+
 
 # ──────────────────────────────────────────────────────────────────
 # Step 1: Generate Multiple Query Variations
@@ -52,17 +64,29 @@ for i, variation in enumerate(query_variations, 1):
 
 print("\n" + "="*60)
 
+
 # ──────────────────────────────────────────────────────────────────
-# Step 2: Search with Each Query Variation & Store Results
+# Step 2: Hybrid Search with Each Query Variation & Store Results
 # ──────────────────────────────────────────────────────────────────
 
-retriever = db.as_retriever(search_kwargs={"k": 5})  # Get more docs for better RRF
+# 1. Vector Retriever
+vector_retriever = db.as_retriever(search_kwargs={"k": 5})
+
+# 2. BM25 Retriever
+bm25_retriever = BM25Retriever.from_documents(documents=chunks)
+bm25_retriever.k = 5
+
+hybrid_retriever = EnsembleRetriever(
+    retrievers=[vector_retriever, bm25_retriever],
+    weights=[0.7, 0.3]
+)
+
 all_retrieval_results = []  # Store all results for RRF
 
 for i, query in enumerate(query_variations, 1):
     print(f"\n=== RESULTS FOR QUERY {i}: {query} ===")
     
-    docs = retriever.invoke(query)
+    docs = hybrid_retriever.invoke(query)
     all_retrieval_results.append(docs)  # Store for RRF calculation
     
     print(f"Retrieved {len(docs)} documents:\n")
@@ -151,12 +175,12 @@ def reciprocal_rank_fusion(chunk_lists, k=60, verbose=True):
     
     return sorted_chunks
 
-# Apply RRF to our retrieval results
-fused_results = reciprocal_rank_fusion(all_retrieval_results, k=60, verbose=True)
 
 # ──────────────────────────────────────────────────────────────────
 # Step 4: Display Final Fused Results
 # ──────────────────────────────────────────────────────────────────
+
+fused_results = reciprocal_rank_fusion(all_retrieval_results, k=60, verbose=True)
 
 print("\n" + "="*60)
 print("FINAL RRF RANKING")
@@ -165,8 +189,56 @@ print("="*60)
 print(f"\nTop {min(10, len(fused_results))} documents after RRF fusion:\n")
 
 for rank, (doc, rrf_score) in enumerate(fused_results[:10], 1):
-    print(f"🏆 RANK {rank} (RRF Score: {rrf_score:.4f})")
-    print(f"{doc.page_content[:200]}...")
+    print(f"Rank {rank} (RRF Score: {rrf_score:.4f})")
+    print(f"{doc.page_content[:100]}...")
     print("-" * 50)
 
-print(f"\n✅ RRF Complete! Fused {len(fused_results)} unique documents from {len(query_variations)} query variations.")
+
+# ──────────────────────────────────────────────────────────────────
+# Step 5: Apply Cohere Reranking
+# ──────────────────────────────────────────────────────────────────
+
+# Use the fused RRF results as input to the reranker
+retrieved_docs = [doc for doc, _ in fused_results]
+
+print("\n" + "-"*50)
+print("After Cohere Reranking:")
+print("-"*50)
+
+# Initialize Cohere reranker
+reranker = CohereRerank(model="rerank-english-v3.0", top_n=10)
+
+# Rerank the retrieved documents
+reranked_docs = reranker.compress_documents(retrieved_docs, query)
+
+# Show reranked results
+for i, doc in enumerate(reranked_docs, 1):
+    print(f"Rank {i:2d}. {doc.page_content[:50]}...")
+
+
+# ──────────────────────────────────────────────────────────────────
+# Step 6: Final Answer Generation
+# ──────────────────────────────────────────────────────────────────
+
+print("\n" + "="*80)
+print("FINAL: RAG with Reranked Context")
+print("-"*40)
+
+# Use top 5 reranked documents for final answer
+top_reranked = reranked_docs[:5]
+
+combined_input = f"""Based on the following documents, please answer this question: {query}
+
+Documents:
+{chr(10).join([f"- {doc.page_content}" for doc in top_reranked])}
+
+Please provide a clear, helpful answer using only the information from these documents."""
+
+messages = [
+    SystemMessage(content="You are a helpful assistant."),
+    HumanMessage(content=combined_input),
+]
+
+result = llm.invoke(messages)
+print("Generated Response:")
+print(result.content)
