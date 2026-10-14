@@ -17,7 +17,7 @@ load_dotenv()
 # Setup
 persistent_directory = "db/chroma_db"
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.3)
+llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.3)
 
 db = Chroma(
     persist_directory=persistent_directory,
@@ -47,7 +47,10 @@ print(f"Original Query: {original_query}\n")
 # Step 1: Generate Multiple Query Variations
 # ──────────────────────────────────────────────────────────────────
 
-llm_with_tools = llm.with_structured_output(QueryVariations)
+llm_with_tools = llm.with_structured_output(
+    QueryVariations,
+    method="json_schema",
+)
 
 prompt = f"""Generate 3 different variations of this query that would help retrieve relevant documents:
 
